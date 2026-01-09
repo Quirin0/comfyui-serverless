@@ -346,66 +346,68 @@ def get_container_cpu_info(job_id=None):
 
         # First get the number of CPUs visible to the container
         try:
-            # Count available CPUs by checking /proc/cpuinfo
-            available_cpus = 0
-            with open('/proc/cpuinfo', 'r') as f:
-                for line in f:
-                    if line.startswith('processor'):
-                        available_cpus += 1
-            if available_cpus > 0:
-                cpu_info['available_cpus'] = available_cpus
+            # Count available CPUs by reading schedstat files
+            cpu_count = 0
+            while os.path.exists(f'/proc/{cpu_count}/schedstat'):
+                cpu_count += 1
+            cpu_info['available_cpus'] = cpu_count
         except Exception as e:
-            logging.warning(f'Failed to get available CPUs: {str(e)}', job_id)
+            logging.warning(f'Failed to count available CPUs: {str(e)}', job_id)
+            # Fall back to os.cpu_count()
+            cpu_info['available_cpus'] = os.cpu_count() or 0
 
-        # Try getting CPU quota and period from cgroups v2
+        # Get cgroup CPU allocation
+        # Try cgroups v2 first
         try:
             with open('/sys/fs/cgroup/cpu.max', 'r') as f:
-                cpu_data = f.read().strip().split()
-                if cpu_data[0] != 'max':
-                    cpu_quota = int(cpu_data[0])
-                    cpu_period = int(cpu_data[1])
-                    # Calculate the number of CPUs as quota/period
-                    cpu_info['allocated_cpus'] = cpu_quota / cpu_period
+                content = f.read().strip()
+                if content != 'max':
+                    quota, period = content.split()
+                    if period != '0':
+                        cpu_info['allocated_cpus'] = int(quota) / int(period)
+
         except FileNotFoundError:
-            # Try cgroups v1 paths
+            # Fall back to cgroups v1
             try:
                 with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'r') as f:
-                    cpu_quota = int(f.read().strip())
-                with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r') as f:
-                    cpu_period = int(f.read().strip())
-                if cpu_quota > 0:  # -1 means no limit
-                    cpu_info['allocated_cpus'] = cpu_quota / cpu_period
+                    quota = int(f.read().strip())
+                    if quota != -1:  # -1 means unlimited
+                        with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r') as f:
+                            period = int(f.read().strip())
+                            cpu_info['allocated_cpus'] = quota / period
+
             except FileNotFoundError:
-                # Try another possible location
+                # Try the third possible location for cgroups
                 try:
                     with open('/sys/fs/cgroup/cpu.cfs_quota_us', 'r') as f:
-                        cpu_quota = int(f.read().strip())
-                    with open('/sys/fs/cgroup/cpu.cfs_period_us', 'r') as f:
-                        cpu_period = int(f.read().strip())
-                    if cpu_quota > 0:
-                        cpu_info['allocated_cpus'] = cpu_quota / cpu_period
-                except FileNotFoundError:
-                    logging.warning('Could not find cgroup CPU quota information', job_id)
+                        quota = int(f.read().strip())
+                        if quota != -1:
+                            with open('/sys/fs/cgroup/cpu.cfs_period_us', 'r') as f:
+                                period = int(f.read().strip())
+                                cpu_info['allocated_cpus'] = quota / period
 
-        # Get container CPU usage stats
+                except FileNotFoundError:
+                    logging.warning('Could not find cgroup CPU allocation information', job_id)
+
+        # Get CPU usage if available
         try:
-            # Try cgroups v2 path
             with open('/sys/fs/cgroup/cpu.stat', 'r') as f:
                 for line in f:
                     if line.startswith('usage_usec'):
                         cpu_info['usage_usec'] = int(line.split()[1])
-                        break
+
         except FileNotFoundError:
-            # Try cgroups v1 path
             try:
                 with open('/sys/fs/cgroup/cpu/cpuacct.usage', 'r') as f:
-                    cpu_info['usage_usec'] = int(f.read().strip()) / 1000  # Convert ns to μs
+                    cpu_info['usage_nsec'] = int(f.read().strip())
+
             except FileNotFoundError:
                 try:
                     with open('/sys/fs/cgroup/cpuacct.usage', 'r') as f:
-                        cpu_info['usage_usec'] = int(f.read().strip()) / 1000
+                        cpu_info['usage_nsec'] = int(f.read().strip())
+
                 except FileNotFoundError:
-                    pass
+                    logging.warning('Could not find CPU usage information', job_id)
 
         # Log CPU information
         cpu_log_parts = []
@@ -733,6 +735,46 @@ def setup_logging():
     root_logger.addHandler(log_handler)
 
 
+# ---------------------------------------------------------------------------- #
+#                                 Merge Function                               #
+# ---------------------------------------------------------------------------- #
+# Paths fixos no Serverless
+STORAGE_PATH = "/runpod-volume"  # O storage é sempre montado aqui
+COMFY_ROOT = "/comfyui"  # Path padrão desse template (confira no Dockerfile do repo)
+CUSTOM_NODES_DEST = os.path.join(COMFY_ROOT, "custom_nodes")
+
+def merge_custom_nodes_from_storage():
+    if not os.path.exists(STORAGE_PATH):
+        print("Storage não montado. Usando apenas o GitHub.")
+        return
+
+    # Path da sua pasta runpod-slim/ComfyUI no storage (ajuste se necessário)
+    storage_comfy = os.path.join(STORAGE_PATH, "runpod-slim/ComfyUI")
+    storage_custom = os.path.join(storage_comfy, "custom_nodes")
+
+    if os.path.exists(storage_custom):
+        print(f"Mesclando custom nodes do storage: {storage_custom}")
+        for item in os.listdir(storage_custom):
+            src = os.path.join(storage_custom, item)
+            dest = os.path.join(CUSTOM_NODES_DEST, item)
+               
+            if os.path.isdir(src):
+                shutil.copytree(src, dest, dirs_exist_ok=True)  # mescla se já existir
+                print(f"Mesclado diretório: {item}")
+            else:
+                shutil.copy(src, dest)
+                print(f"Copiado arquivo: {item}")
+
+    # Opcional: Mescle models também (se você tiver no storage)
+    storage_models = os.path.join(storage_comfy, "models")
+    comfy_models = os.path.join(COMFY_ROOT, "models")
+    if os.path.exists(storage_models):
+        shutil.copytree(storage_models, comfy_models, dirs_exist_ok=True)
+        print("Models mesclados do storage.")
+
+    print("Custom nodes do storage integrados com sucesso!")
+
+
 if __name__ == '__main__':
     session = requests.Session()
     retries = Retry(total=10, backoff_factor=0.1, status_forcelist=[502, 503, 504])
@@ -740,6 +782,7 @@ if __name__ == '__main__':
     setup_logging()
     wait_for_service(url=f'{BASE_URI}/system_stats')
     logging.info('ComfyUI API is ready')
+    merge_custom_nodes_from_storage()  # Chame a função aqui antes de iniciar o serverless
     logging.info('Starting Runpod Serverless...')
     runpod.serverless.start(
         {
