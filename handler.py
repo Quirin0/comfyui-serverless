@@ -744,35 +744,50 @@ COMFY_ROOT = "/comfyui"  # Path padrão desse template (confira no Dockerfile do
 CUSTOM_NODES_DEST = os.path.join(COMFY_ROOT, "custom_nodes")
 
 def merge_custom_nodes_from_storage():
+    """
+    Cria links simbólicos (symlinks) dos custom_nodes e models do storage para o ComfyUI do worker.
+    - Instantâneo, zero cópia, zero espaço extra.
+    """
     if not os.path.exists(STORAGE_PATH):
-        print("Storage não montado. Usando apenas o GitHub.")
+        logging.info("Storage não montado. Usando apenas o que veio do GitHub.")
         return
 
-    # Path da sua pasta runpod-slim/ComfyUI no storage (ajuste se necessário)
+    # Path da sua pasta runpod-slim/ComfyUI no storage (confirme com ls /runpod-volume no Pod)
     storage_comfy = os.path.join(STORAGE_PATH, "runpod-slim/ComfyUI")
-    storage_custom = os.path.join(storage_comfy, "custom_nodes")
 
+    # Path do ComfyUI no worker (nesse template é /comfyui - ajuste se o erro persistir)
+    COMFY_ROOT = "/comfyui"  # ← MUDANÇA PRINCIPAL AQUI (não /workspace/runpod-slim/ComfyUI)
+    CUSTOM_NODES_DEST = os.path.join(COMFY_ROOT, "custom_nodes")
+    MODELS_DEST = os.path.join(COMFY_ROOT, "models")
+
+    # Custom Nodes
+    storage_custom = os.path.join(storage_comfy, "custom_nodes")
     if os.path.exists(storage_custom):
-        print(f"Mesclando custom nodes do storage: {storage_custom}")
+        logging.info(f"Criando symlinks para custom_nodes do storage: {storage_custom}")
         for item in os.listdir(storage_custom):
             src = os.path.join(storage_custom, item)
             dest = os.path.join(CUSTOM_NODES_DEST, item)
-               
-            if os.path.isdir(src):
-                shutil.copytree(src, dest, dirs_exist_ok=True)  # mescla se já existir
-                print(f"Mesclado diretório: {item}")
-            else:
-                shutil.copy(src, dest)
-                print(f"Copiado arquivo: {item}")
 
-    # Opcional: Mescle models também (se você tiver no storage)
+            # Remove destino antigo se existir (evita erro "File exists")
+            if os.path.lexists(dest):
+                os.unlink(dest)
+            os.symlink(src, dest)
+            logging.info(f"Symlink criado para custom_node: {item}")
+
+    # Models (checkpoints, loras, vae, etc.)
     storage_models = os.path.join(storage_comfy, "models")
-    comfy_models = os.path.join(COMFY_ROOT, "models")
     if os.path.exists(storage_models):
-        shutil.copytree(storage_models, comfy_models, dirs_exist_ok=True)
-        print("Models mesclados do storage.")
+        logging.info(f"Criando symlinks para models do storage: {storage_models}")
+        for item in os.listdir(storage_models):
+            src = os.path.join(storage_models, item)
+            dest = os.path.join(MODELS_DEST, item)
 
-    print("Custom nodes do storage integrados com sucesso!")
+            if os.path.lexists(dest):
+                os.unlink(dest)
+            os.symlink(src, dest)
+            logging.info(f"Symlink criado em models: {item}")
+
+    logging.info("Symlinks criados com sucesso! ComfyUI agora usa os arquivos diretamente do storage.")
 
 
 if __name__ == '__main__':
